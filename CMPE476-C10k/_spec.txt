@@ -1,0 +1,604 @@
+                                                                           CMPE476 — C10K Project
+
+
+                               CMPE476 — Distributed Systems
+                                      Course Project
+
+                   The C10K Problem in Practice:
+  Building and Benchmarking a Concurrent TCP Server in C
+
+ Language                  C (ISO C11, POSIX.1-2008 / Linux)
+ Platform                  Linux (any modern distribution with epoll(7))
+ Group size                2 students per group (individual submissions also allowed)
+                           You must implement the code yourself, not using LLM.
+ Deadline                  May 8, 2026 @ 23:59
+
+
+1. Overview
+In Chapter 2 of the course we discussed the C10K problem: the challenge of designing a single
+server that can sustain ten thousand (and eventually millions of) simultaneous client connections.
+We contrasted the simple thread-per-connection model — which does not scale past a few
+thousand clients because every thread consumes roughly a megabyte of stack and forces the
+kernel to context-switch among thousands of runnable threads — with the event-loop model used
+by production systems such as Nginx, Redis, HAProxy, and Node.js, which multiplexes many
+connections on a single thread using non-blocking I/O and a readiness notification mechanism
+(epoll on Linux, kqueue on BSD, IOCP on Windows).
+In this project you will build both architectures yourselves, from the ground up, in C. You will then
+run them side by side under load and write a short report comparing their memory footprint,
+throughput, and latency. The goal is not merely to produce working code: it is to turn the abstract
+numbers we drew on the slides (1 MB per thread, thousands vs. millions of connections) into
+measurements you have produced on your own laptop, so the trade-offs become something you
+have felt rather than something you have read.
+
+
+2. Learning Objectives
+After completing this project you should be able to:
+   •   write a correct, POSIX-compliant TCP server in C using the socket, bind, listen, accept
+       system calls;
+   •   implement, and reason about the synchronisation requirements of, a thread-per-
+       connection server using pthreads;
+   •   implement a single-threaded event-loop server using epoll(7) and non-blocking I/O,
+       including correct handling of partial reads and EAGAIN;
+
+
+
+
+                                            Page 1 / 12
+                                                                         CMPE476 — C10K Project
+
+
+   •   design a line-based wire protocol with well-defined error semantics (unknown command,
+       over-length line, graceful close);
+   •   measure the memory and throughput of a concurrent server under controlled load and
+       interpret the results in terms of the architectural trade-offs covered in lecture.
+
+
+3. Background
+You do not need to invent the wire protocol or the test harness — both are supplied. Your work is
+concentrated on the two server architectures and on the benchmark report. The five pure
+functions that sit beneath both servers (request parsing, response formatting, non-blocking I/O,
+and a line-oriented receive buffer) are defined by a header file you must not modify, so that, as
+the instructor, my test harness can link directly against your object files and score you
+deterministically.
+
+  Note
+  Think of the project as three loosely coupled deliverables: (A) a thread-per-connection server,
+  (B) an epoll-based event-loop server, and (C) a short benchmark report. The shared protocol
+  layer is graded by automated unit tests; the two servers are graded by functional tests that
+  connect real clients to the server and check responses; the report is graded by reading.
+
+
+
+4. Deliverables
+You must submit the following, packaged as described in Section 11:
+
+Part A — threadserv (30 points)
+A thread-per-connection TCP server. A new POSIX thread (pthread_create) is spawned for each
+accepted client. Each worker thread reads lines from its socket, processes them through the
+shared protocol functions, writes the response back, and terminates when the client closes the
+connection or sends QUIT. The main thread loops on accept(). Global state (connection counts)
+must be protected by a mutex.
+
+Part B — epollserv (40 points)
+A single-threaded event-loop TCP server using epoll(7) in edge-triggered mode. All sockets
+(including the listening socket) must be non-blocking. The server must correctly drain each ready
+socket until read() returns EAGAIN, accumulate partial lines in a per-connection buffer, and
+process each complete line through the shared protocol functions. No pthreads, no fork, no busy-
+waiting.
+
+
+
+
+                                           Page 2 / 12
+                                                                              CMPE476 — C10K Project
+
+
+Part C — Benchmark report (20 points)
+A 2–3 page PDF report (report.pdf) in which you run both servers against a concurrent client
+generator, measure memory usage and throughput at 1,000, 5,000, and 10,000 simultaneous
+connections, present the results in a table and a chart, and interpret them in light of the C10K
+discussion from Chapter 2. A reference client generator (client_flood.c) is supplied; you may use
+it or write your own.
+
+Automated unit tests (10 points)
+The five API functions defined in server_api.h (see Section 6) are exercised by a CUnit test
+harness you are provided. Passing this harness is worth 10 points directly and is also a
+precondition for full credit on Parts A and B, since both servers call these functions.
+
+
+5. Wire Protocol
+Both servers speak the same text-based protocol. One request per line, one response per line,
+all lines terminated by '\n'. The server tolerates an optional '\r' before the '\n' (so telnet and netcat
+both work). The command word is case-sensitive and uppercase; there is no leading whitespace
+before the command.
+
+ Request                    Response                          Meaning
+
+ PING                       PONG                              Liveness check.
+
+ ECHO <text>                <text>                            Echo everything after the single
+                                                              separating space.
+
+ ECHO                       (empty line)                      ECHO with no payload returns an
+                                                              empty response line.
+
+ TIME                       <unix_seconds>                    Current wall-clock time in seconds
+                                                              since the UNIX epoch.
+
+ STATS                      <active_connections>              Current number of established client
+                                                              connections.
+
+ QUIT                       BYE                               Server sends BYE then closes the
+                                                              socket.
+ anything else              ERR unknown_command               Unknown command; connection stays
+                                                              open.
+ line > 1024 bytes (no      ERR line_too_long                 Server emits the error line, then closes
+ '\n')                                                        the socket.
+
+  Note
+  The maximum accepted line length (excluding the terminating newline) is 1024 bytes.
+  Responses are at most 1088 bytes. These constants are defined as MAX_LINE_LEN and
+  MAX_RESPONSE_LEN in server_api.h — use them, do not hard-code the numbers.
+
+
+
+                                              Page 3 / 12
+                                                                         CMPE476 — C10K Project
+
+
+
+6. Fixed API — server_api.h
+You receive a header file, server_api.h, that defines the types and function signatures your
+implementation must expose. Do not modify this file. The CUnit test harness #includes it and links
+against your object files; any change to the header (renaming a field, changing a signature, adding
+arguments) will cause link-time failure and you will lose all automated-test points.
+The following five functions are graded by CUnit. You must provide exactly these signatures, with
+exactly this behaviour.
+
+6.1 parse_request
+  int parse_request(const char *line, request_t *out);
+
+Parses one line (already stripped of its trailing newline) into the output struct. The command word
+is matched exactly: PING, ECHO, TIME, STATS, QUIT. Any leading whitespace, lowercase, or
+unrecognised token must produce CMD_UNKNOWN. For ECHO, exactly one space separates
+the command from the payload; any further spaces belong to the payload (so "ECHO hi" has arg
+== " hi", with a leading space). Returns 0 on success (including when the command is
+CMD_UNKNOWN), or -1 if either argument is NULL.
+
+6.2 format_response
+  int format_response(const request_t *req,
+             const server_state_t *st,
+             char *out, size_t outlen);
+
+Writes the response line (without the trailing newline) into out, truncating to outlen-1 bytes and
+always NUL-terminating. Returns the number of bytes written (excluding the NUL) on success, or
+-1 on error. The mapping from request kind to response text is given by the table in Section 5.
+The caller is responsible for appending '\n' before writing to the socket.
+
+6.3 set_nonblocking
+  int set_nonblocking(int fd);
+
+Sets the O_NONBLOCK flag on fd using fcntl(2). Returns 0 on success, -1 on failure (with errno
+set). This is required by epollserv for the listening socket and every accepted socket.
+
+6.4 buffer_append
+  int buffer_append(conn_buf_t *b, const char *data, size_t n);
+
+Appends n bytes of data to the per-connection line buffer. If appending would overflow
+CONN_BUF_CAPACITY and no '\n' is present in the combined content, the buffer is reset and
+the line_too_long flag is latched to 1; subsequent take-line calls must surface this exactly once
+(see next function). Returns 0 on success, -1 on NULL input.
+
+
+
+
+                                                 Page 4 / 12
+                                                                               CMPE476 — C10K Project
+
+
+6.5 buffer_take_line
+  int buffer_take_line(conn_buf_t *b, char *out, size_t outmax);
+
+Extracts the next complete line (up to but not including '\n', with any '\r' before the '\n' also stripped)
+into out, removes it from the buffer, and returns 1. Returns 0 if the buffer does not yet contain a
+complete line. If the line_too_long flag is set, returns 1 exactly once with out[0] == '\0' and then
+clears the flag — this is how the epoll server learns that the peer has sent an over-length line and
+should be disconnected. Returns -1 on NULL input.
+
+  ⚠ Important
+  Because the CUnit harness links against these exact symbols, you should place
+  parse_request and format_response in a file called protocol.c, and set_nonblocking,
+  buffer_init, buffer_append, buffer_take_line in a file called buffer.c. The Makefile assumes
+  these file names. You may add static helper functions inside either file; keep all non-static
+  externally visible symbols to what server_api.h declares.
+
+
+
+7. Part A — threadserv
+The entry point is main in threadserv.c. Command-line argument: the TCP port to listen on (default
+9090 if no argument is given).
+Required structure:
+    1. The main thread creates an AF_INET / SOCK_STREAM socket, sets
+       SO_REUSEADDR, binds it to INADDR_ANY on the given port, calls listen(), then loops
+       on accept().
+    2. For every accepted client, main spawns a detached POSIX thread (pthread_create
+       followed by pthread_detach) that runs a worker function. The worker receives the client
+       file descriptor as its argument.
+    3. Inside the worker: increment active_connections (under the mutex), then loop — read()
+       from the socket, append into a conn_buf_t, extract complete lines with buffer_take_line,
+       call parse_request and format_response, write the response followed by '\n' back to the
+       socket. Exit the loop on EOF, on QUIT, on line_too_long (after sending ERR
+       line_too_long), or on a write error.
+    4. Before the worker returns, close the socket and decrement active_connections (under
+       the mutex).
+    5. Install a SIGPIPE handler — or use SIG_IGN — so that a client closing the socket mid-
+       write does not kill the server. Check the return value of write() and treat failures as a
+       signal to end the connection.
+Required properties that the functional test will check:
+
+
+
+
+                                                 Page 5 / 12
+                                                                                               CMPE476 — C10K Project
+
+
+   •   STATS returns a correct, monotonically plausible count (no double counting, no leaks
+       after clients disconnect).
+   •   The server does not segfault, leak file descriptors, or exit when clients abruptly
+       disconnect.
+   •   The server handles at least 500 concurrent connections without crashing.
+
+
+8. Part B — epollserv
+The entry point is main in epollserv.c. Command-line argument: the TCP port (default 9091).
+Required structure:
+   1. Create and bind the listening socket as in Part A. Call set_nonblocking on it. Create an
+      epoll instance with epoll_create1, and register the listening socket for EPOLLIN.
+   2. Run an event loop around epoll_wait. When the listening socket is readable, loop calling
+      accept() until it returns -1 with EAGAIN (accept-all-you-can). Set every accepted socket
+      non-blocking and register it with EPOLLIN | EPOLLET, attaching a per-connection struct
+      (containing at least the fd and a conn_buf_t) to the event's data.ptr.
+   3. When a client socket is reported readable, loop calling read() until it returns -1 with
+      EAGAIN (required by edge-triggered mode: you only get one notification per readiness
+      transition, so you must drain). Feed each chunk into buffer_append. Then loop calling
+      buffer_take_line until it returns 0, processing each line.Define constant INTEST as 1.
+
+
+
+
+   4. On QUIT, on line_too_long, on read()==0 (peer closed), or on any unrecoverable error,
+      remove the fd from epoll, close it, free the per-connection struct, and decrement
+      active_connections.
+   5. The entire server runs on one thread. No pthreads, no fork.
+
+  ⚠ Important
+  Edge-triggered mode is the subtle part. If you forget the drain loop, or if you use EPOLLIN
+  without EPOLLET and get level-triggered semantics by accident, the test harness will still
+  work for a few clients but will deadlock under the 10,000-connection benchmark — which is
+  precisely the point of choosing edge-triggered in the first place.
+
+Required properties that the functional test will check:
+   •   Works correctly when many clients send partial lines (one byte at a time).
+   •   Works correctly when one client sends many lines back-to-back in a single TCP
+       segment.
+   •   Handles at least 10,000 concurrent connections without crashing. (The exact threshold
+       depends on your ulimit -n; raising it to 65,535 is part of the project, not an accident.)
+
+
+
+
+                                            Page 6 / 12
+                                                                             CMPE476 — C10K Project
+
+
+
+9. Part C — Benchmark Report
+Produce a short report (2–3 pages, PDF) that compares threadserv and epollserv under identical
+load. The supplied client generator client_flood.c opens N concurrent TCP connections, sends M
+requests on each, collects wall-clock latency, and prints aggregate statistics. You are free to
+modify it or replace it, as long as your methodology is reproducible. Note that each group develop
+and test their project under different circumstances; so, I need to know your configuration to
+evaluate your submission.
+Your report must contain, at minimum:
+   •    a description of your test setup (machine, kernel version, ulimit -n, any sysctl tuning);
+   •    a table of memory (RSS -- Resident Set Size, via /proc/<pid>/status) and throughput
+        (requests per second) for each server at 1,000, 5,000, and 10,000 concurrent clients;
+   •    at least one chart — either a bar chart comparing RSS or a line chart of throughput vs.
+        concurrency;
+   •    a one-paragraph discussion interpreting the results in terms of the thread-stack
+        overhead and context-switching cost that we discussed in Chapter 2;
+   •    one honest limitation of your methodology (e.g., "localhost loopback hides the effect of
+        network latency").
+
+  Note
+  You are not expected to beat Nginx. Typical results on a laptop: threadserv peaks around
+  2,000–5,000 concurrent clients before RSS climbs past several gigabytes; epollserv handles
+  10,000 clients with a few tens of megabytes of RSS. If your numbers differ wildly, include that
+  in your discussion rather than hiding it — honest negative results are graded favourably.
+
+
+
+10. Provided Files
+The project archive CMPE476-C10k.tar.gz contains:
+
+ File                    Purpose                                                     Modify?
+
+ server_api.h            Fixed API (types and function signatures).                  No
+
+ tests.c                 CUnit test harness for the five graded functions.           No
+
+ Makefile                Builds threadserv, epollserv, and test_runner.              No
+
+ client_flood.c          Reference load generator for Part C.                        Optional
+
+ protocol.c              Stub — you write parse_request and format_response.         Yes
+
+ buffer.c                Stub — you write set_nonblocking and buffer_*.              Yes
+
+ threadserv.c            Stub — you write the thread-per-connection server.          Yes
+
+
+
+                                             Page 7 / 12
+                                                                         CMPE476 — C10K Project
+
+
+
+ File                          Purpose                                             Modify?
+
+ epollserv.c                   Stub — you write the epoll event loop.              Yes
+
+ report.pdf                    You create this file.                               Yes
+
+
+11. Build and Test Instructions
+11.1 Prerequisites
+On Ubuntu/Debian:
+  sudo apt-get install build-essential libcunit1-dev
+
+Raise the file-descriptor limit before running the 10,000-client benchmark:
+  ulimit -n 65535
+
+
+11.2 Building
+From inside the project directory:
+  make       # builds threadserv and epollserv
+  make test   # builds test_runner and runs the CUnit suite
+  make clean    # removes all generated files
+
+
+11.3 Running the servers
+  ./threadserv 9090         # listens on TCP :9090
+  ./epollserv 9091         # listens on TCP :9091
+
+
+  # In another terminal:
+  nc localhost 9090
+  PING
+  ECHO hello world
+  STATS
+  QUIT
+
+
+11.4 Running the CUnit tests
+The instructor-supplied test harness tests.c compiles into an executable called test_runner. It
+exercises your protocol.c and buffer.c directly — no sockets, no threads — across four suites and
+29 individual assertions. It must compile against server_api.h without modification and must report
+zero failures for full credit on the "Automated unit tests" line of the rubric.
+  $ make test
+  ... (build output) ...
+  ./test_runner
+
+
+
+
+                                                       Page 8 / 12
+                                                                              CMPE476 — C10K Project
+
+
+    CUnit - A unit testing framework for C - Version 2.1-3
+
+
+  Suite: parse_request
+   Test: test_parse_null_args ...passed
+   Test: test_parse_ping ...passed
+   ...
+  Suite: format_response
+   ...
+  Suite: set_nonblocking
+   ...
+  Suite: buffer
+   ...
+
+
+  Run Summary:
+   suites 4  tests 29 asserts 68
+   Passed 29   Failed 0
+
+The test_runner executable exits with status 0 if every assertion passes and non-zero otherwise,
+so your submission can be graded non-interactively. You are strongly encouraged to add your
+own CUnit tests to tests.c while developing — but you must NOT ship a modified tests.c; during
+grading we overwrite it with the authoritative version.
+
+
+12. Summary of Graded Test Functions
+The CUnit suite in tests.c is organised into four suites. You do not need to call any test function
+from your own code — the suite is self-contained and invokes your five API functions directly. The
+table below lists every test function by name, so you know exactly what behaviour will be
+checked.
+
+12.1 Suite parse_request
+
+ Test function                                What it checks
+
+ test_parse_null_args                         Returns -1 when line or out is NULL.
+
+ test_parse_ping                              "PING" → CMD_PING, arg empty.
+
+ test_parse_time                              "TIME" → CMD_TIME.
+
+ test_parse_stats                             "STATS" → CMD_STATS.
+
+ test_parse_quit                              "QUIT" → CMD_QUIT.
+
+ test_parse_echo_empty                        "ECHO" alone → CMD_ECHO with empty arg.
+
+ test_parse_echo_payload                      "ECHO hello world" → CMD_ECHO, arg == "hello
+                                              world".
+
+ test_parse_echo_preserves_extra_sp           "ECHO hi" → arg == " hi" (leading space kept).
+
+
+
+
+                                                Page 9 / 12
+                                                                               CMPE476 — C10K Project
+
+
+
+ Test function                        What it checks
+
+ aces
+
+ test_parse_empty_line                "" → CMD_UNKNOWN.
+
+ test_parse_unknown                   "HELLO" → CMD_UNKNOWN.
+
+ test_parse_leading_space_is_unknow   " PING" → CMD_UNKNOWN.
+ n
+
+ test_parse_case_sensitive            "ping" → CMD_UNKNOWN.
+
+12.2 Suite format_response
+
+ Test function                        What it checks
+
+ test_format_null_args                -1 when req or out is NULL.
+
+ test_format_ping                     CMD_PING → "PONG".
+
+ test_format_echo                     CMD_ECHO → verbatim arg.
+
+ test_format_echo_empty               CMD_ECHO with empty arg → "".
+
+ test_format_time                     CMD_TIME → decimal UNIX time within the call
+                                      window.
+
+ test_format_stats                    CMD_STATS → decimal st->active_connections.
+
+ test_format_quit                     CMD_QUIT → "BYE".
+
+ test_format_unknown                  CMD_UNKNOWN → "ERR unknown_command".
+
+ test_format_too_long                 CMD_TOO_LONG → "ERR line_too_long".
+
+12.3 Suite set_nonblocking
+
+ Test function                        What it checks
+
+ test_set_nonblocking_sets_flag       O_NONBLOCK is actually set on the file descriptor
+                                      afterwards (checked via fcntl F_GETFL).
+
+12.4 Suite buffer
+
+ Test function                        What it checks
+
+ test_buffer_init                     buffer_init zeroes len and line_too_long.
+
+ test_buffer_single_line              A complete line is extracted verbatim and removed from
+                                      the buffer.
+
+ test_buffer_crlf_stripped            Trailing '\r' before '\n' is stripped.
+
+
+
+
+                                       Page 10 / 12
+                                                                           CMPE476 — C10K Project
+
+
+
+ Test function                            What it checks
+
+ test_buffer_partial_line                 A line split across two appends is correctly reassembled.
+
+ test_buffer_multiple_lines               Multiple back-to-back lines are extracted one at a time.
+
+ test_buffer_overflow_latches_too_lon     A payload larger than CONN_BUF_CAPACITY with no
+ g                                        newline latches line_too_long and surfaces it exactly
+                                          once.
+
+ test_buffer_null_guards                  NULL arguments return -1 without crashing.
+
+
+13. Submission Instructions
+Package your submission as a single tar.gz file named:
+  CMPE476-C10k-<group_id>-<surname1>[_<surname2>].tar.gz
+
+Example: CMPE476-C10k-07-Yilmaz_Cetin.tar.gz
+The archive must unpack into a single directory containing:
+   •    protocol.c, buffer.c, threadserv.c, epollserv.c (your implementation);
+   •    the unmodified server_api.h, Makefile, and tests.c that you received (so we can verify
+        nothing was tampered with);
+   •    report.pdf (Part C);
+   •    a README.md listing each group member's name, student ID, and a one-sentence
+        statement of what they contributed.
+
+  ⚠ Important
+  Before you submit, extract your own archive into a clean directory, run `make test` and `make`,
+  and check that all tests pass and both binaries build without any warnings. I will be grading
+  what you have submitted, not what is on your computer.
+
+
+
+14. Appendix — Example Session
+Below is a transcript of a correct server session using netcat as the client.
+  $ ./epollserv 9091 &
+  epollserv listening on 9091
+
+
+  $ nc localhost 9091
+  PING
+  PONG
+  ECHO hello from istanbul
+  hello from istanbul
+  ECHO
+
+
+
+
+                                            Page 11 / 12
+                                                                              CMPE476 — C10K Project
+
+
+                 <-- empty line is correct
+  TIME
+  1745000000
+  STATS
+  1
+  BADCOMMAND
+  ERR unknown_command
+  QUIT
+  BYE
+  $               <-- connection closed by server
+
+And the transcript of a successful make && make test:
+  $ make
+  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -O2 -g -c protocol.c -o protocol.o
+  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -O2 -g -c buffer.c -o buffer.o
+  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -O2 -g -c threadserv.c -o threadserv.o
+  gcc -o threadserv threadserv.o protocol.o buffer.o -lpthread
+  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -O2 -g -c epollserv.c -o epollserv.o
+  gcc -o epollserv epollserv.o protocol.o buffer.o -lpthread
+
+
+  $ make test
+  ./test_runner
+  Run Summary: tests 29 Passed 29 Failed 0
+
+
+
+
+                                             Page 12 / 12
+
