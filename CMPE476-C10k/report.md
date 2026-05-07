@@ -1,69 +1,62 @@
+---
+header-includes:
+  - \usepackage{float}
+  - \usepackage[section]{placeins}
+---
+
 # CMPE476 C10K Benchmark Report
 
 ## 1. Test Setup
 
 - Machine: ASUS - System Product Name
-- CPU / RAM / Exchange: 12 / 16211MB / 4096MB
-- OS and kernel: Ubuntu on WSL2 (Linux Duran-Desktop 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux)
-- `ulimit -n`: 10240
-- Any `sysctl` tuning: none 
+- CPU / RAM / Swap: 12 vCPU / 16211 MB RAM / 4096 MB swap
+- OS and kernel: Ubuntu on WSL2 (`Linux Duran-Desktop 6.6.87.2-microsoft-standard-WSL2`)
+- `ulimit -n`: **65535** (set before the benchmark run)
+- Any `sysctl` tuning: none
 
 ## 2. Methodology
 
-- Built with `make` from the submitted source.
-- Load generator: `client_flood`.
-- For each server (`threadserv`, `epollserv`) and each concurrency level (1000, 5000, 10000):
+- Build command: `make clean && make && make client_flood`
+- Load generator: `client_flood`
+- Target concurrency: `1000`, `5000`, `10000`
+- Requests per client: `100`
+- Host: `127.0.0.1`
+- For each server (`threadserv`, `epollserv`) and concurrency level:
   - launch server
   - run `client_flood <host> <port> <clients> <requests_each>`
-  - record requests/sec and RSS from `/proc/<pid>/status`
+  - record throughput from `client_flood` output
+  - sample `/proc/<pid>/status` during active load and record **peak VmRSS**
   - stop server
-- Requests per client: 100.
-- Host: `127.0.0.1`.
 
 ## 3. Results Table
 
-| Server | Clients | Requests Each | Completed Requests | Elapsed (s) | RPS | RSS Before (kB) | RSS After (kB) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| threadserv | 1000 | 100 | 100000 | 0.330 | 303030 | 1408 | 3648 |
-| threadserv | 5000 | 100 | 500000 | 1.332 | 375375 | 1408 | 7184 |
-| threadserv | 10000 | 100 | 1000000 | 2.670 | 374532 | 1408 | 9236 |
-| epollserv | 1000 | 100 | 100000 | 0.198 | 505051 | 1408 | 3748 |
-| epollserv | 5000 | 100 | 500000 | 0.965 | 518135 | 1408 | 16768 |
-| epollserv | 10000 | 100 | 1000000 | 1.918 | 521376 | 1408 | 32256 |
+| Server | Clients | Requests Each | Comptd. Rqsts. | Elapsed (s) | RPS | RSS Before (kB) | Peak RSS (kB) | RSS After (kB) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| t.serv | 1000 |100 |100000 |0.245 | 407862| 1408|18304 |3904 |
+| t.serv | 5000 |100 |500000 | 1.224|408514 | 1408|80640 | 7208|
+| t.serv | 10000 | 100|1000000 |3.348 |298691 |1408 |96768 |8532 |
+| epollserv | 1000 | 100|100000 | 0.183| 545564| 1408|4352 |3492 |
+| epollserv | 5000 |100| 500000 |0.883 | 566296| 1408|16512 |11632 |
+| epollserv | 10000 |100 |1000000 |1.860 | 537594| 1408|32128 | 32128|
 
-## 4. Chart
+## 4. Charts
 
-### Throughput vs Clients (RPS)
 
-| Clients | Threadserv RPS | Epollserv RPS |
-|---:|---:|---:|
-| 1000 | 303030 | 505051 |
-| 5000 | 375375 | 518135 |
-| 10000 | 374532 | 521376 |
+### Throughput vs Clients 
 
-### RSS After Run vs Clients (kB)
+![](throughput_vs_clients.png){latex-placement="H" width=85%}
 
-| Clients | Threadserv RSS (kB) | Epollserv RSS (kB) |
-|---:|---:|---:|
-| 1000 | 3648 | 3748 |
-| 5000 | 7184 | 16768 |
-| 10000 | 9236 | 32256 |
+
+### Peak RSS vs Clients 
+
+
+![](peak_rss_vs_clients.png){latex-placement="H" width=85%}
 
 
 ## 5. Analysis
 
-The epoll-based server outperformed the thread-per-connection server at all tested concurrency levels.
+Throughput shows a clear split between the two designs: `threadserv` is roughly flat from 1k to 5k clients (around 408k RPS) but drops noticeably at 10k (around 299k RPS), so thread per connection starts to degrade at high concurrency. `epollserv` stays both faster and steadier (about 546k, 566k, and 538k RPS), which is expected because nonblocking `epoll` avoids creating/scheduling thousands of threads. Memory tells the same story: peak RSS for `threadserv` rises sharply (18,304 -> 80,640 -> 96,768 kB), while `epollserv` stays much lower (4,352 -> 16,512 -> 32,128 kB), so the event-loop model scales better in both throughput and memory at 10k clients.
 
-- At 1000 clients, `epollserv` reached 505,051 RPS vs 303,030 RPS (`~66.7%` higher).
-- At 5000 clients, `epollserv` reached 518,135 RPS vs 375,375 RPS (`~38.0%` higher).
-- At 10000 clients, `epollserv` reached 521,376 RPS vs 374,532 RPS (`~39.2%` higher).
+## 6. Limitation
 
-Thread-per-connection performance improves from 1k to 5k clients, then plateaus around ~375k RPS at 10k clients, which is consistent with scheduler overhead and thread-management costs dominating under high concurrency. In contrast, the epoll event loop remains scalable because one thread handles readiness events for many sockets without per-connection thread scheduling overhead.
-
-RSS-after-run values in this measurement are higher for `epollserv` at larger client counts. This is opposite to the common expectation and is likely influenced by measurement methodology:
-
-- This report captures RSS near/after run completion, not peak RSS during active load.
-- Allocator behavior can keep arenas/pages mapped even after connections close.
-- The event-loop implementation may allocate per-connection buffers that increase resident memory at high fan-out.
-
-Therefore, throughput conclusions are strong, while memory conclusions should be interpreted carefully unless peak RSS is sampled continuously during each run.
+The benchmark runs on localhost (WSL2 loopback), so it does not include real network effects such as latency, packet loss, or cross-machine variability; results on a real network may differ.

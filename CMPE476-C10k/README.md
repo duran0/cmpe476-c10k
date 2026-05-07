@@ -1,10 +1,8 @@
 # CMPE476 C10K Project Submission
 
 ## Group Members
-- Name Surname, Student ID, contribution summary.
-- Name Surname, Student ID, contribution summary.
-
-Update this section before submission.
+- Duran Kaan Altın, 2020400108, implemented `protocol.c`, `buffer.c`, and benchmarking automation.
+- Üveys Aydemir, 2020400069, implemented  `threadserv.c`, `epollserv.c`, and report.
 
 ## Build And Test (Linux)
 ```bash
@@ -31,24 +29,3 @@ BADCOMMAND
 QUIT
 ```
 
-## Benchmark
-Use:
-```bash
-./run_bench.sh
-```
-
-This generates:
-- `benchmark_results.csv`
-- `report.md` (fill in machine-specific details and chart screenshot path)
-
-Then export `report.md` to `report.pdf`.
-Example:
-```bash
-pandoc report.md -o report.pdf
-```
-
-## Package
-From the parent directory of `CMPE476-C10k/`:
-```bash
-./CMPE476-C10k/package_submission.sh <group_id> <surname1> [surname2]
-```

@@ -1,0 +1,8 @@
+*.o
+threadserv
+epollserv
+client_flood
+test_runner
+.bench_*
+benchmark_results.csv
+*.tar.gz
